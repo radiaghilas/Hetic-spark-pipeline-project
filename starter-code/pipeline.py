@@ -298,8 +298,9 @@ def ecrire_gold(resultats):
     for nom, df in resultats.items():
         chemin = f"{SORTIE_GOLD}/{nom}"
         print(f"✓ Écriture de {nom} ({df.count()} lignes)...")
-        # coalesce(1) est OK car les résultats sont petits (synthèse)
-        df.coalesce(1).write.mode("overwrite").parquet(chemin)
+        # Utiliser coalesce(4) au lieu de coalesce(1) pour éviter OutOfMemory
+        # Les résultats sont petits donc c'est acceptable
+        df.coalesce(4).write.mode("overwrite").parquet(chemin)
         print(f"  Écrit dans {chemin}")
     
     print("\n✓ Tous les résultats écrits en Parquet")
