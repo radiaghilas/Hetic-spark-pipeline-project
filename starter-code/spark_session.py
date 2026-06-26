@@ -29,10 +29,15 @@ def get_spark(app_name: str = "Projet Jour 4", shuffle_partitions: int = 64) -> 
         .appName(app_name)
         # Mode local : Spark utilise tous les coeurs disponibles de la machine.
         .master("local[*]")
+        # Allocuer plus de mémoire pour éviter OutOfMemory
+        .config("spark.driver.memory", "4g")
+        .config("spark.executor.memory", "4g")
         # Nombre de partitions de shuffle raisonnable pour un volume de laptop.
         .config("spark.sql.shuffle.partitions", str(shuffle_partitions))
         # AQE est activé par défaut en Spark 3+ et 4 ; on l'explicite pour mémoire.
         .config("spark.sql.adaptive.enabled", "true")
+        # Réduire la pression mémoire lors du spill
+        .config("spark.sql.shuffle.partitions", "32")
         .getOrCreate()
     )
     # Réduire le bruit dans la console : on ne garde que les avertissements.
