@@ -13,6 +13,7 @@ L'énoncé complet et la grille : projects/projet-jour-4.md
 """
 
 import sys
+import time
 from pathlib import Path
 
 from pyspark.sql import functions as F
@@ -44,14 +45,16 @@ def ingestion(spark):
     df = spark.read.parquet(DATA_BRUT)
 
     print("\n=== INGESTION DES DONNÉES BRUTES ===")
-    print(f"Format : Parquet, {df.count()} lignes")
+    nb_lignes = df.count()
+    print(f"Format : Parquet, {nb_lignes:,} lignes")
+    print(f"Colonnes : {len(df.columns)}")
     df.printSchema()
     print("\nAperçu (5 premières lignes) :")
     df.show(5)
-    return df
+    return df, nb_lignes
 
 
-def nettoyage(df):
+def nettoyage(df, nb_lignes_brut):
     """Étape 1b : typer, dériver des colonnes, nettoyer (bronze -> silver).
 
     TODO :
@@ -114,12 +117,16 @@ def nettoyage(df):
         {"passenger_count": 1, "tip_amount": 0}
     )
     
-    print(f"Après nettoyage : {df.count()} lignes")
+    nb_lignes_propre = df.count()
+    pct_supprime = round(100 * (1 - nb_lignes_propre / nb_lignes_brut), 2)
+    
+    print(f"Après nettoyage : {nb_lignes_propre:,} lignes")
+    print(f"Lignes supprimées : {nb_lignes_brut - nb_lignes_propre:,} ({pct_supprime}%)")
     print("Exemple après nettoyage :")
     df.select("tpep_pickup_datetime", "duree_min", "trip_distance", "fare_amount", 
               "heure_pickup", "jour_semaine").show(5)
     
-    return df
+    return df, nb_lignes_propre
 
 
 def ecrire_silver(df, spark):
@@ -277,13 +284,51 @@ def transformation_et_analyses(spark):
     print("✓ Top 5 heures par jour de semaine (classement par Window) :")
     analyse_3.show(10)
     
+    # ========== ANALYSE 4 (BONUS) : DÉTECTION D'ANOMALIES ==========
+    # Identifier les prix suspects (Z-score > 3 = 3 écarts-types au-delà de la moyenne)
+    print("\n--- Analyse 4 (BONUS) : Détection d'anomalies de prix (STATS) ---")
+    
+    stats_prix = df.select(
+        F.avg("total_amount").alias("prix_moyen"),
+        F.stddev("total_amount").alias("prix_stddev"),
+        F.min("total_amount").alias("prix_min"),
+        F.max("total_amount").alias("prix_max"),
+        F.percentile_approx("total_amount", 0.99).alias("prix_p99"),
+    )
+    
+    stats_dict = stats_prix.collect()[0].asDict()
+    prix_moyen = stats_dict["prix_moyen"]
+    prix_stddev = stats_dict["prix_stddev"]
+    
+    # Calculer le Z-score pour chaque course
+    analyse_4 = (
+        df.withColumn(
+            "z_score",
+            (F.col("total_amount") - prix_moyen) / prix_stddev
+        )
+        .filter(F.col("z_score").cast("int") > 3)  # Anomalies majeures
+        .select("tpep_pickup_datetime", "PULocationID", "DOLocationID", 
+                "total_amount", "trip_distance", "z_score")
+        .orderBy(F.desc("z_score"))
+        .limit(20)
+    )
+    
+    print(f"✓ Statistiques de prix :")
+    print(f"  Moyenne : ${prix_moyen:.2f}")
+    print(f"  Écart-type : ${prix_stddev:.2f}")
+    print(f"  Min/Max : ${stats_dict['prix_min']:.2f} / ${stats_dict['prix_max']:.2f}")
+    print(f"  P99 : ${stats_dict['prix_p99']:.2f}")
+    print(f"\nTop 20 courses avec prix anormal (|Z-score| > 3) :")
+    analyse_4.show(5)
+    
     # Vérifier que tout est rempli
-    if analyse_1 is None or analyse_2 is None or analyse_3 is None:
+    if analyse_1 is None or analyse_2 is None or analyse_3 is None or analyse_4 is None:
         raise RuntimeError("L'une des analyses n'a pas pu être créée.")
     
     return {"analyse_1_revenu_zones": analyse_1, 
             "analyse_2_trajets_zones": analyse_2, 
-            "analyse_3_heures_semaine": analyse_3}
+            "analyse_3_heures_semaine": analyse_3,
+            "analyse_4_anomalies_prix": analyse_4}
 
 
 def ecrire_gold(resultats):
@@ -295,18 +340,32 @@ def ecrire_gold(resultats):
     """
     print("\n=== ÉCRITURE COUCHE GOLD (Résultats synthèse) ===")
     
-    for nom, df in resultats.items():
-        chemin = f"{SORTIE_GOLD}/{nom}"
-        print(f"✓ Écriture de {nom} ({df.count()} lignes)...")
-        # Utiliser coalesce(4) au lieu de coalesce(1) pour éviter OutOfMemory
-        # Les résultats sont petits donc c'est acceptable
-        df.coalesce(4).write.mode("overwrite").parquet(chemin)
-        print(f"  Écrit dans {chemin}")
+    # Créer les dossiers de sortie
+    Path(SORTIE_GOLD).mkdir(exist_ok=True)
+    csv_output = Path(SORTIE_GOLD) / "csv"
+    csv_output.mkdir(exist_ok=True)
     
-    print("\n✓ Tous les résultats écrits en Parquet")
+    for nom, df in resultats.items():
+        chemin_parquet = f"{SORTIE_GOLD}/{nom}"
+        chemin_csv = str(csv_output / f"{nom}.csv")
+        
+        nb_lignes = df.count()
+        print(f"✓ Écriture de {nom} ({nb_lignes} lignes)...")
+        
+        # Écrire en Parquet
+        df.coalesce(4).write.mode("overwrite").parquet(chemin_parquet)
+        
+        # Écrire aussi en CSV (plus lisible)
+        df.coalesce(1).write.mode("overwrite").option("header", "true").csv(chemin_csv)
+        print(f"  ✓ Parquet : {chemin_parquet}")
+        print(f"  ✓ CSV : {chemin_csv}")
+    
+    print("\n✓ Tous les résultats écrits en Parquet et CSV")
 
 
 def main():
+    temps_debut = time.time()
+    
     spark = get_spark("Projet Jour 4 - Pipeline Taxi NYC")
     print("\n" + "="*70)
     print("PIPELINE ETL + ANALYSE - TAXI NYC (3 mois)")
@@ -316,21 +375,38 @@ def main():
 
     # Étape 1 : ingestion et nettoyage (bronze -> silver)
     print("\n🔄 ÉTAPE 1 : INGESTION ET NETTOYAGE")
-    brut = ingestion(spark)
-    propre = nettoyage(brut)
+    temps_etape1 = time.time()
+    brut, nb_brut = ingestion(spark)
+    propre, nb_propre = nettoyage(brut, nb_brut)
     ecrire_silver(propre, spark)
+    temps_etape1 = time.time() - temps_etape1
 
     # Étape 2 : transformation et analyses (silver -> gold)
     print("\n🔄 ÉTAPE 2 : TRANSFORMATIONS ET ANALYSES")
+    temps_etape2 = time.time()
     resultats = transformation_et_analyses(spark)
+    temps_etape2 = time.time() - temps_etape2
 
     # Étape 3 : finalisation
     print("\n🔄 ÉTAPE 3 : FINALISATION")
+    temps_etape3 = time.time()
     ecrire_gold(resultats)
+    temps_etape3 = time.time() - temps_etape3
 
+    temps_total = time.time() - temps_debut
+    
+    # Résumé final
     print("\n" + "="*70)
     print("✓ PIPELINE TERMINÉ AVEC SUCCÈS !")
     print("="*70)
+    print(f"\n📈 Résumé d'exécution :")
+    print(f"  Étape 1 (Ingestion + Nettoyage) : {temps_etape1:.2f}s")
+    print(f"  Étape 2 (Analyses) : {temps_etape2:.2f}s")
+    print(f"  Étape 3 (Export) : {temps_etape3:.2f}s")
+    print(f"  ────────────────────────────────")
+    print(f"  Total : {temps_total:.2f}s ({temps_total/60:.2f}m)")
+    print(f"\n  Données traitées : {nb_brut:,} lignes brutes → {nb_propre:,} lignes propres")
+    print(f"  Compression : {100 - (nb_propre/nb_brut)*100:.1f}% de doublons/anomalies")
     
     # Garder la session vivante pour explorer la Spark UI.
     input("\n📊 Spark UI sur http://localhost:4040 - Appuyez sur Entrée pour quitter...")
