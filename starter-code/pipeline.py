@@ -59,7 +59,7 @@ def ingestion(spark):
     # Lire movies
     movies = spark.read.option("header", "true").schema(movies_schema).csv(MOVIES_CSV)
     
-    print("\n=== INGESTION ===")
+    print("\n📥 === INGESTION ===")
     print(f"Ratings ({RATINGS_CSV}):")
     ratings.printSchema()
     print(f"Nombre de ratings bruts: {ratings.count()}")
@@ -84,7 +84,7 @@ def nettoyage(ratings, movies, nb_ratings_brut):
     """
     t0 = time.time()
     
-    print("\n=== NETTOYAGE ===")
+    print("\n🧹 === NETTOYAGE ===")
     nb_ratings_avant = ratings.count()
     print(f"Ratings avant nettoyage: {nb_ratings_avant}")
     
@@ -125,7 +125,7 @@ def ecrire_silver(ratings_clean, movies_clean):
     """Étape 1c : écrire les couches silver en Parquet."""
     t0 = time.time()
     
-    print("\n=== ÉCRITURE SILVER ===")
+    print("\n💾 === ÉCRITURE SILVER ===")
     
     # Écrire ratings
     ratings_clean.write.mode("overwrite").parquet(f"{SORTIE_SILVER}/ratings")
@@ -149,7 +149,7 @@ def transformation_et_analyses(spark):
     """
     t0 = time.time()
     
-    print("\n=== TRANSFORMATION & ANALYSES ===")
+    print("\n🔄 === TRANSFORMATION & ANALYSES ===")
     
     # Relire les données silver
     ratings = spark.read.parquet(f"{SORTIE_SILVER}/ratings")
@@ -273,70 +273,83 @@ def ecrire_gold(resultats):
     """Étape 3 : écrire les résultats en Parquet et CSV."""
     t0 = time.time()
     
-    print("\n=== ÉCRITURE GOLD ===")
+    print("\n📦 === ÉCRITURE GOLD ===")
     
     for nom, df in resultats.items():
         # Écrire en Parquet
         chemin_parquet = f"{SORTIE_GOLD}/{nom}"
         df.coalesce(1).write.mode("overwrite").parquet(chemin_parquet)
-        print(f"✓ Parquet écrit: {chemin_parquet}")
+        print(f"Parquet écrit: {chemin_parquet}")
         
         # Écrire en CSV (pour lecture directe)
         chemin_csv = f"{CSV_OUTPUT_DIR}/{nom}.csv"
         df.coalesce(1).write.mode("overwrite").option("header", "true").csv(chemin_csv)
-        print(f"✓ CSV écrit: {chemin_csv}")
+        print(f"CSV écrit: {chemin_csv}")
     
     temps = time.time() - t0
     print(f"Temps écriture gold: {temps:.2f}s")
 
 
 def main():
+    spark = None
     t_start = time.time()
-    
-    spark = get_spark("Projet Jour 4 - Pipeline MovieLens")
-    print("=" * 70)
-    print("PIPELINE MOVIELENS - JOUR 4")
-    print("=" * 70)
-    print("Spark UI disponible sur http://localhost:4040")
 
-    # Étape 1 : ingestion et nettoyage (bronze -> silver)
-    ratings_brut, movies_brut = ingestion(spark)
-    nb_ratings_brut = ratings_brut.count()
-    
-    ratings_clean, movies_clean = nettoyage(ratings_brut, movies_brut, nb_ratings_brut)
-    ecrire_silver(ratings_clean, movies_clean)
-
-    # Étape 2 : transformation et analyses (silver -> gold)
-    resultats = transformation_et_analyses(spark)
-
-    # Étape 3 : finalisation
-    ecrire_gold(resultats)
-
-    # Résumé final
-    t_total = time.time() - t_start
-    print("\n" + "=" * 70)
-    print("RÉSUMÉ DU PIPELINE")
-    print("=" * 70)
-    print(f"Temps total d'exécution: {t_total:.2f}s")
-    print(f"Ratings traités: {nb_ratings_brut}")
-    print(f"Ratings nettoyés: {ratings_clean.count()}")
-    print(f"Films: {movies_clean.count()}")
-    print("=" * 70)
-
-    # Garder la session vivante pour explorer la Spark UI
     try:
-        input("\nSpark UI sur http://localhost:4040 - Appuyez sur Entrée pour quitter...")
-    except EOFError:
-        pass
-    
-    spark.stop()
+        spark = get_spark("Projet Jour 4 - Pipeline MovieLens")
+        print("=" * 70)
+        print("🚀 PIPELINE MOVIELENS - JOUR 4")
+        print("=" * 70)
+        print("Spark UI disponible sur http://localhost:4040")
+
+        # Étape 1 : ingestion et nettoyage (bronze -> silver)
+        ratings_brut, movies_brut = ingestion(spark)
+        nb_ratings_brut = ratings_brut.count()
+
+        ratings_clean, movies_clean = nettoyage(ratings_brut, movies_brut, nb_ratings_brut)
+        ecrire_silver(ratings_clean, movies_clean)
+
+        # Étape 2 : transformation et analyses (silver -> gold)
+        resultats = transformation_et_analyses(spark)
+
+        # Étape 3 : finalisation
+        ecrire_gold(resultats)
+
+        # Résumé final
+        t_total = time.time() - t_start
+        print("\n" + "=" * 70)
+        print("📋 RÉSUMÉ DU PIPELINE")
+        print("=" * 70)
+        print(f"Temps total d'exécution: {t_total:.2f}s")
+        print(f"Ratings traités: {nb_ratings_brut}")
+        print(f"Ratings nettoyés: {ratings_clean.count()}")
+        print(f"Films: {movies_clean.count()}")
+        print("=" * 70)
+
+        # Garder la session vivante pour explorer la Spark UI
+        try:
+            input("\n📊Spark UI sur http://localhost:4040 - Appuyez sur Entrée pour quitter...")
+        except EOFError:
+            pass
+
+        return 0
+
+    except FileNotFoundError as e:
+        print()
+        print("Fichier introuvable pendant l'exécution du pipeline :", e)
+        return 1
+    except Exception as e:
+        print(f"\n❌ Erreur : {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        if spark is not None:
+            spark.stop()
 
 
 if __name__ == "__main__":
     try:
-        main()
-    except NotImplementedError as e:
-        print()
-        print("Pipeline incomplet :", e)
-        print("Complétez les sections TODO dans starter-code/pipeline.py.")
-        sys.exit(1)
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nPipeline interrompu par l'utilisateur.")
+        sys.exit(130)
