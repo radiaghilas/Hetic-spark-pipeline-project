@@ -1,9 +1,6 @@
-"""Squelette de pipeline data pour le projet du jour 4.
+"""Pipeline data MovieLens : projet jour 4.
 
-Complétez les sections marquées TODO avec le jeu de données que vous avez choisi
-(taxi NYC multi-mois, DVF immobilier, accidents ONISR, ou MovieLens).
-
-Architecture cible (vue en cours) :
+Architecture :
     brut (bronze) -> nettoyé (silver, Parquet) -> agrégé (gold, résultats)
 
 Lancement, depuis la racine du projet :
@@ -14,411 +11,345 @@ L'énoncé complet et la grille : projects/projet-jour-4.md
 
 import sys
 import time
-from pathlib import Path
+import os
 
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.types import StructType, StructField, IntegerType, FloatType, StringType, LongType
 
 from spark_session import get_spark
 
-# Chemins. Adaptez-les au jeu de données que vous avez choisi.
-# Pour l'option Taxi NYC multi-mois, on lit tous les fichiers mensuels présents.
-DATA_BRUT = "data/datasets/yellow_tripdata_2024-*.parquet"
-ZONES_CSV = "data/datasets/taxi_zone_lookup.csv"
+# Chemins pour MovieLens small
+RATINGS_CSV = "data/datasets/ml-latest-small/ratings.csv"
+MOVIES_CSV = "data/datasets/ml-latest-small/movies.csv"
 SORTIE_SILVER = "data/output/clean"
 SORTIE_GOLD = "data/output/analyses"
 
-# Créer les dossiers de sortie s'ils n'existent pas
-Path("data/output").mkdir(exist_ok=True)
+# Créer le dossier CSV pour l'export
+CSV_OUTPUT_DIR = "data/output/analyses/csv"
+os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
 
 def ingestion(spark):
-    """Étape 1a : lire les données brutes.
-
-    TODO :
-    - Lire vos données brutes (Parquet : spark.read.parquet ; CSV : spark.read.csv).
-    - Pour du CSV, définir un SCHÉMA EXPLICITE (StructType) plutôt que inferSchema :
-      plus sûr et plus rapide. Mettre option("sep", ";") pour les CSV français.
-    - Inspecter : printSchema(), show(5), count().
+    """Étape 1a : lire les données brutes MovieLens.
+    
+    - ratings.csv : userId, movieId, rating, timestamp
+    - movies.csv : movieId, title, genres
     """
-    # Lire les 3 mois de données taxi en Parquet (le schéma est embarqué)
-    df = spark.read.parquet(DATA_BRUT)
+    t0 = time.time()
+    
+    # Schéma explicite pour ratings
+    ratings_schema = StructType([
+        StructField("userId", IntegerType(), True),
+        StructField("movieId", IntegerType(), True),
+        StructField("rating", FloatType(), True),
+        StructField("timestamp", LongType(), True),
+    ])
+    
+    # Lire ratings
+    ratings = spark.read.option("header", "true").schema(ratings_schema).csv(RATINGS_CSV)
+    
+    # Schéma explicite pour movies
+    movies_schema = StructType([
+        StructField("movieId", IntegerType(), True),
+        StructField("title", StringType(), True),
+        StructField("genres", StringType(), True),
+    ])
+    
+    # Lire movies
+    movies = spark.read.option("header", "true").schema(movies_schema).csv(MOVIES_CSV)
+    
+    print("\n📥 === INGESTION ===")
+    print(f"Ratings ({RATINGS_CSV}):")
+    ratings.printSchema()
+    print(f"Nombre de ratings bruts: {ratings.count()}")
+    
+    print(f"\nMovies ({MOVIES_CSV}):")
+    movies.printSchema()
+    print(f"Nombre de films: {movies.count()}")
+    
+    temps = time.time() - t0
+    print(f"Temps ingestion: {temps:.2f}s")
+    
+    return ratings, movies
 
-    print("\n=== INGESTION DES DONNÉES BRUTES ===")
-    nb_lignes = df.count()
-    print(f"Format : Parquet, {nb_lignes:,} lignes")
-    print(f"Colonnes : {len(df.columns)}")
-    df.printSchema()
-    print("\nAperçu (5 premières lignes) :")
-    df.show(5)
-    return df, nb_lignes
 
-
-def nettoyage(df, nb_lignes_brut):
-    """Étape 1b : typer, dériver des colonnes, nettoyer (bronze -> silver).
-
-    TODO :
-    - Créer vos colonnes dérivées avec withColumn (durée, prix au km/m2, heure...).
-    - PROTÉGER les divisions : F.when(denominateur > 0, ...).otherwise(None).
-    - Filtrer les valeurs aberrantes (montants négatifs, distances/surfaces nulles,
-      dates incohérentes). Utiliser & | ~ (pas and/or/not) et parenthéser.
-    - Retirer les doublons (dropDuplicates) et gérer les manquants (na.drop/na.fill).
+def nettoyage(ratings, movies, nb_ratings_brut):
+    """Étape 1b : nettoyer les données MovieLens (bronze -> silver).
+    
+    - Valider les ratings (entre 0.5 et 5.0)
+    - Valider timestamps
+    - Retirer les doublons
+    - Retirer les manquants
     """
-    print("\n=== NETTOYAGE ===")
+    t0 = time.time()
     
-    # 1. Créer des colonnes dérivées
-    df = df.withColumn(
-        # Durée en minutes
-        "duree_min",
-        (F.unix_timestamp(F.col("tpep_dropoff_datetime"))
-         - F.unix_timestamp(F.col("tpep_pickup_datetime"))) / 60,
-    ).withColumn(
-        # Prix par km (protéger la division)
-        "prix_par_km",
-        F.when(F.col("trip_distance") > 0, F.col("fare_amount") / F.col("trip_distance"))
-        .otherwise(None),
-    ).withColumn(
-        # Heure de pickup
-        "heure_pickup",
-        F.hour(F.col("tpep_pickup_datetime")),
-    ).withColumn(
-        # Jour de la semaine (1=dimanche, 7=samedi) selon Spark dayofweek
-        "jour_semaine",
-        F.dayofweek(F.col("tpep_pickup_datetime")),
-    ).withColumn(
-        # Mois pour traçabilité
-        "mois",
-        F.month(F.col("tpep_pickup_datetime")),
+    print("\n🧹 === NETTOYAGE ===")
+    nb_ratings_avant = ratings.count()
+    print(f"Ratings avant nettoyage: {nb_ratings_avant}")
+    
+    # Filtrer les ratings invalides (doivent être entre 0.5 et 5.0)
+    ratings_clean = ratings.filter(
+        (F.col("rating") >= 0.5) & (F.col("rating") <= 5.0)
     )
     
-    # 2. Filtrer les valeurs aberrantes
-    # Durée entre 0 et 180 minutes (3 heures)
-    df = df.filter(
-        (F.col("duree_min") > 0) & (F.col("duree_min") <= 180)
-    )
-    # Distance positive et raisonnable
-    df = df.filter(
-        (F.col("trip_distance") > 0) & (F.col("trip_distance") <= 100)
-    )
-    # Montants positifs
-    df = df.filter(
-        (F.col("fare_amount") > 0) & (F.col("total_amount") > 0)
-    )
-    # Au moins 1 passager
-    df = df.filter(
-        F.col("passenger_count") > 0
-    )
+    # Valider timestamps (doivent être > 0)
+    ratings_clean = ratings_clean.filter(F.col("timestamp") > 0)
     
-    # 3. Retirer les doublons
-    df = df.dropDuplicates()
+    # Retirer les doublons sur (userId, movieId)
+    ratings_clean = ratings_clean.dropDuplicates(["userId", "movieId"])
     
-    # 4. Gérer les valeurs manquantes (remplir par 0 pour les colonnes numériques clés)
-    df = df.na.fill(
-        {"passenger_count": 1, "tip_amount": 0}
-    )
+    # Retirer les lignes avec valeurs manquantes
+    ratings_clean = ratings_clean.na.drop()
     
-    nb_lignes_propre = df.count()
-    pct_supprime = round(100 * (1 - nb_lignes_propre / nb_lignes_brut), 2)
+    # Nettoyage des movies
+    movies_clean = movies.dropDuplicates(["movieId"]).na.drop()
     
-    print(f"Après nettoyage : {nb_lignes_propre:,} lignes")
-    print(f"Lignes supprimées : {nb_lignes_brut - nb_lignes_propre:,} ({pct_supprime}%)")
-    print("Exemple après nettoyage :")
-    df.select("tpep_pickup_datetime", "duree_min", "trip_distance", "fare_amount", 
-              "heure_pickup", "jour_semaine").show(5)
+    nb_ratings_apres = ratings_clean.count()
+    nb_movies = movies_clean.count()
     
-    return df, nb_lignes_propre
+    doublons_supprimés = nb_ratings_avant - nb_ratings_apres
+    pct_supprimé = (doublons_supprimés / nb_ratings_avant * 100) if nb_ratings_avant > 0 else 0
+    
+    print(f"Ratings après nettoyage: {nb_ratings_apres}")
+    print(f"Doublons/anomalies supprimés: {doublons_supprimés} ({pct_supprimé:.2f}%)")
+    print(f"Films uniques: {nb_movies}")
+    
+    temps = time.time() - t0
+    print(f"Temps nettoyage: {temps:.2f}s")
+    
+    return ratings_clean, movies_clean
 
 
-def ecrire_silver(df, spark):
-    """Étape 1c : écrire la couche intermédiaire nettoyée en Parquet.
-
-    TODO :
-    - Écrire en Parquet (write.mode("overwrite").parquet(SORTIE_SILVER)).
-    - Optionnel : partitionBy sur une colonne à FAIBLE cardinalité (mois, département,
-      année). Jamais sur une colonne à forte cardinalité (cela crée trop de fichiers).
-    """
-    print("\n=== ÉCRITURE COUCHE SILVER (Parquet nettoyé) ===")
-    # Écrire partitionné par mois (faible cardinalité = 3 mois)
-    df.write.mode("overwrite").partitionBy("mois").parquet(SORTIE_SILVER)
-    print(f"✓ Couche silver écrite dans {SORTIE_SILVER}")
-    print(f"  Partitionnée par mois (3 partitions)")
+def ecrire_silver(ratings_clean, movies_clean):
+    """Étape 1c : écrire les couches silver en Parquet."""
+    t0 = time.time()
     
-    # Vérifier ce qui a été écrit
-    df_verify = spark.read.parquet(SORTIE_SILVER)
-    print(f"  Vérification : {df_verify.count()} lignes relues du Parquet")
+    print("\n💾 === ÉCRITURE SILVER ===")
+    
+    # Écrire ratings
+    ratings_clean.write.mode("overwrite").parquet(f"{SORTIE_SILVER}/ratings")
+    print(f"Ratings écrites dans {SORTIE_SILVER}/ratings")
+    
+    # Écrire movies
+    movies_clean.write.mode("overwrite").parquet(f"{SORTIE_SILVER}/movies")
+    print(f"Movies écrites dans {SORTIE_SILVER}/movies")
+    
+    temps = time.time() - t0
+    print(f"Temps écriture silver: {temps:.2f}s")
 
 
 def transformation_et_analyses(spark):
-    """Étape 2 : relire le propre, puis 3 analyses (silver -> gold).
-
-    On relit la couche Parquet nettoyée (pas les données brutes).
-
-    TODO : produire AU MOINS TROIS analyses, dont :
-    - une AGRÉGATION (groupBy + agg) ;
-    - une JOINTURE (join, idéalement avec F.broadcast sur la petite table) ;
-    - une WINDOW FUNCTION (Window.partitionBy(...).orderBy(...), row_number/rank/lag).
-    Et au moins UNE OPTIMISATION justifiée : broadcast, cache, ou repartition.
+    """Étape 2 : analyses MovieLens (silver -> gold).
+    
+    Trois analyses :
+    1. Agrégation : Films les mieux notés (avec seuil minimum de votes)
+    2. Jointure + Broadcast : Statistiques complètes des films
+    3. Window Function : Top 5 films par genre (ranking)
     """
-    print("\n=== ANALYSES (silver -> gold) ===")
+    t0 = time.time()
     
-    # Relire la couche Parquet nettoyée
-    df = spark.read.parquet(SORTIE_SILVER)
+    print("\n🔄 === TRANSFORMATION & ANALYSES ===")
     
-    # OPTIMISATION : cache car df sera réutilisé par plusieurs analyses
-    print("Cache du DataFrame silver (réutilisé 3 fois)...")
-    df = df.cache()
-    df.count()  # matérialise le cache
+    # Relire les données silver
+    ratings = spark.read.parquet(f"{SORTIE_SILVER}/ratings")
+    movies = spark.read.parquet(f"{SORTIE_SILVER}/movies")
     
-    # Charger la table des zones
-    zones = spark.read.option("header", "true").option("inferSchema", "true").csv(ZONES_CSV)
-    zones = zones.select("LocationID", "Zone", "Borough")
-    print(f"Table zones chargée : {zones.count()} zones")
+    # Cache des données réutilisées par plusieurs analyses
+    ratings = ratings.cache()
+    ratings.count()  # matérialise le cache
+    print(f"Cache ratings: {ratings.count()} lignes")
     
-    # ========== ANALYSE 1 : AGRÉGATION ==========
-    # Revenu total et moyen par zone de pickup
-    print("\n--- Analyse 1 : Revenu par zone (AGRÉGATION) ---")
-    analyse_1 = (
-        df.groupBy("PULocationID")
+    # --- Analyse 1 : Agrégation - Top films par note moyenne ----------
+    print("\n--- Analyse 1 : Agrégation (Top films notés) ---")
+    t1 = time.time()
+    
+    min_votes = 20  # Seuil minimum de votes pour éviter les biais
+    
+    analyse_1 = (ratings
+        .groupBy("movieId")
         .agg(
-            F.count("*").alias("nb_courses"),
-            F.sum("total_amount").alias("revenu_total"),
-            F.avg("total_amount").alias("revenu_moyen"),
-            F.avg("tip_amount").alias("pourboire_moyen"),
+            F.count("rating").alias("nb_votes"),
+            F.avg("rating").alias("note_moyenne"),
+            F.min("rating").alias("note_min"),
+            F.max("rating").alias("note_max"),
+            F.stddev("rating").alias("note_stddev")
         )
-        .filter(F.col("nb_courses") >= 10)  # au moins 10 courses
-        .orderBy(F.desc("revenu_total"))
-        .limit(20)
-    )
-    
-    # Joindre avec les noms de zones pour améliorer la lisibilité
-    # OPTIMISATION : broadcast la petite table des zones (265 lignes)
-    analyse_1 = (
-        analyse_1
-        .join(
-            F.broadcast(zones.select("LocationID", "Zone", "Borough")),
-            F.col("PULocationID") == F.col("LocationID"),
-            "left",
-        )
-        .select("PULocationID", "Zone", "Borough", "nb_courses", 
-                "revenu_total", "revenu_moyen", "pourboire_moyen")
-        .orderBy(F.desc("revenu_total"))
-    )
-    
-    print("✓ Top 20 zones par revenu :")
-    analyse_1.show(5)
-    
-    # ========== ANALYSE 2 : JOINTURE ==========
-    # Top 10 trajets (zone de pickup → zone de dropoff) par nombre de courses
-    print("\n--- Analyse 2 : Trajets zone-à-zone (JOINTURE + BROADCAST) ---")
-    
-    # Charger 2 fois la table zones (pour PULocationID et DOLocationID)
-    zones_pu = zones.select("LocationID", F.col("Zone").alias("Zone_PU"), 
-                            F.col("Borough").alias("Borough_PU"))
-    zones_do = zones.select("LocationID", F.col("Zone").alias("Zone_DO"), 
-                            F.col("Borough").alias("Borough_DO"))
-    
-    # Agrégation avant la jointure pour réduire le volume
-    trajets = (
-        df.groupBy("PULocationID", "DOLocationID")
-        .agg(
-            F.count("*").alias("nb_courses"),
-            F.sum("total_amount").alias("revenu"),
-            F.avg("trip_distance").alias("distance_moy"),
-        )
-        .filter(F.col("nb_courses") >= 10)
-    )
-    
-    # Jointures avec BROADCAST des petites tables
-    analyse_2 = (
-        trajets
-        .join(
-            F.broadcast(zones_pu),
-            F.col("PULocationID") == F.col("LocationID"),
-            "left",
-        )
-        .drop("LocationID")
-        .join(
-            F.broadcast(zones_do),
-            F.col("DOLocationID") == F.col("LocationID"),
-            "left",
-        )
-        .drop("LocationID")
+        .filter(F.col("nb_votes") >= min_votes)
+        .join(movies, on="movieId", how="left")
         .select(
-            "PULocationID", "DOLocationID",
-            "Zone_PU", "Borough_PU",
-            "Zone_DO", "Borough_DO",
-            "nb_courses", "revenu", "distance_moy"
+            "movieId",
+            "title",
+            "nb_votes",
+            F.round("note_moyenne", 2).alias("note_moyenne"),
+            F.round("note_min", 1).alias("note_min"),
+            F.round("note_max", 1).alias("note_max"),
+            F.round("note_stddev", 2).alias("note_stddev")
         )
-        .orderBy(F.desc("nb_courses"))
-        .limit(10)
+        .orderBy(F.desc("note_moyenne"), F.desc("nb_votes"))
     )
     
-    print("✓ Top 10 trajets zone-à-zone par volume :")
-    analyse_2.show(5)
+    print(f"Films avec {min_votes}+ votes trouvés: {analyse_1.count()}")
+    analyse_1.show(10)
+    temps1 = time.time() - t1
+    print(f"Temps analyse 1: {temps1:.2f}s")
     
-    # ========== ANALYSE 3 : WINDOW FUNCTION ==========
-    # Top 10 heures de la journée par revenu total (classement)
-    print("\n--- Analyse 3 : Heures de pickup par revenu (WINDOW FUNCTION) ---")
+    # --- Analyse 2 : Jointure avec Broadcast - Stats complètes par film ---
+    print("\n--- Analyse 2 : Jointure avec Broadcast (stats films) ---")
+    t2 = time.time()
     
-    revenu_par_heure = (
-        df.groupBy("heure_pickup", "jour_semaine")
+    # Broadcast la table des films (petite) dans la jointure
+    movies_broadcast = F.broadcast(movies)
+    
+    analyse_2 = (ratings
+        .join(movies_broadcast, on="movieId", how="left")
+        .groupBy("movieId", "title", "genres")
         .agg(
-            F.sum("total_amount").alias("revenu_total"),
-            F.count("*").alias("nb_courses"),
-            F.avg("total_amount").alias("montant_moyen"),
+            F.count("rating").alias("nb_votes"),
+            F.avg("rating").alias("note_moyenne"),
+            F.count("userId").alias("nb_utilisateurs_uniques")
         )
-    )
-    
-    # Fenêtre pour classer par jour de semaine
-    window_spec = Window.partitionBy("jour_semaine").orderBy(F.desc("revenu_total"))
-    
-    analyse_3 = (
-        revenu_par_heure
-        .withColumn("rang", F.row_number().over(window_spec))
-        .filter(F.col("rang") <= 5)  # Top 5 heures par jour de semaine
-        .select("jour_semaine", "heure_pickup", "rang", "revenu_total", 
-                "nb_courses", "montant_moyen")
-        .orderBy("jour_semaine", "rang")
-    )
-    
-    print("✓ Top 5 heures par jour de semaine (classement par Window) :")
-    analyse_3.show(10)
-    
-    # ========== ANALYSE 4 (BONUS) : DÉTECTION D'ANOMALIES ==========
-    # Identifier les prix suspects (Z-score > 3 = 3 écarts-types au-delà de la moyenne)
-    print("\n--- Analyse 4 (BONUS) : Détection d'anomalies de prix (STATS) ---")
-    
-    stats_prix = df.select(
-        F.avg("total_amount").alias("prix_moyen"),
-        F.stddev("total_amount").alias("prix_stddev"),
-        F.min("total_amount").alias("prix_min"),
-        F.max("total_amount").alias("prix_max"),
-        F.percentile_approx("total_amount", 0.99).alias("prix_p99"),
-    )
-    
-    stats_dict = stats_prix.collect()[0].asDict()
-    prix_moyen = stats_dict["prix_moyen"]
-    prix_stddev = stats_dict["prix_stddev"]
-    
-    # Calculer le Z-score pour chaque course
-    analyse_4 = (
-        df.withColumn(
-            "z_score",
-            (F.col("total_amount") - prix_moyen) / prix_stddev
+        .withColumn("popularite", F.col("nb_votes"))
+        .select(
+            "movieId",
+            "title",
+            "genres",
+            F.round("note_moyenne", 2).alias("note_moyenne"),
+            "nb_votes",
+            "nb_utilisateurs_uniques",
+            "popularite"
         )
-        .filter(F.col("z_score").cast("int") > 3)  # Anomalies majeures
-        .select("tpep_pickup_datetime", "PULocationID", "DOLocationID", 
-                "total_amount", "trip_distance", "z_score")
-        .orderBy(F.desc("z_score"))
-        .limit(20)
+        .orderBy(F.desc("popularite"))
     )
     
-    print(f"✓ Statistiques de prix :")
-    print(f"  Moyenne : ${prix_moyen:.2f}")
-    print(f"  Écart-type : ${prix_stddev:.2f}")
-    print(f"  Min/Max : ${stats_dict['prix_min']:.2f} / ${stats_dict['prix_max']:.2f}")
-    print(f"  P99 : ${stats_dict['prix_p99']:.2f}")
-    print(f"\nTop 20 courses avec prix anormal (|Z-score| > 3) :")
-    analyse_4.show(5)
+    print(f"Statistiques complètes calculées pour {analyse_2.count()} films")
+    analyse_2.show(10)
+    temps2 = time.time() - t2
+    print(f"Temps analyse 2 (avec broadcast): {temps2:.2f}s")
     
-    # Vérifier que tout est rempli
-    if analyse_1 is None or analyse_2 is None or analyse_3 is None or analyse_4 is None:
-        raise RuntimeError("L'une des analyses n'a pas pu être créée.")
+    # --- Analyse 3 : Window Function - Top 5 films par genre ---
+    print("\n--- Analyse 3 : Window Function (Top 5 par genre) ---")
+    t3 = time.time()
     
-    return {"analyse_1_revenu_zones": analyse_1, 
-            "analyse_2_trajets_zones": analyse_2, 
-            "analyse_3_heures_semaine": analyse_3,
-            "analyse_4_anomalies_prix": analyse_4}
+    # Exploder la colonne genres (un film peut avoir plusieurs genres)
+    films_par_genre = (analyse_2
+        .withColumn("genre", F.explode(F.split(F.col("genres"), "\\|")))
+        .select("movieId", "title", "genre", "note_moyenne", "nb_votes")
+    )
+    
+    # Window function : classement par genre
+    fenetre = Window.partitionBy("genre").orderBy(F.desc("note_moyenne"), F.desc("nb_votes"))
+    
+    analyse_3 = (films_par_genre
+        .withColumn("rang", F.row_number().over(fenetre))
+        .filter(F.col("rang") <= 5)
+        .select(
+            "genre",
+            "rang",
+            "title",
+            F.round("note_moyenne", 2).alias("note_moyenne"),
+            "nb_votes",
+            "movieId"
+        )
+        .orderBy("genre", "rang")
+    )
+    
+    print(f"Top 5 films par genre calculés")
+    analyse_3.show(30)
+    temps3 = time.time() - t3
+    print(f"Temps analyse 3 (window): {temps3:.2f}s")
+    
+    temps_total = time.time() - t0
+    print(f"\nTemps total analyses: {temps_total:.2f}s")
+    
+    return {
+        "analyse_1_films_mieux_notes": analyse_1,
+        "analyse_2_stats_films_complets": analyse_2,
+        "analyse_3_top5_par_genre": analyse_3
+    }
 
 
 def ecrire_gold(resultats):
-    """Étape 3 : écrire les résultats de synthèse.
-
-    TODO :
-    - Écrire chaque résultat (Parquet ou CSV). coalesce(1) est acceptable ICI car les
-      résultats agrégés sont PETITS. Ne jamais coalesce(1) un gros DataFrame.
-    """
-    print("\n=== ÉCRITURE COUCHE GOLD (Résultats synthèse) ===")
+    """Étape 3 : écrire les résultats en Parquet et CSV."""
+    t0 = time.time()
     
-    # Créer les dossiers de sortie
-    Path(SORTIE_GOLD).mkdir(exist_ok=True)
-    csv_output = Path(SORTIE_GOLD) / "csv"
-    csv_output.mkdir(exist_ok=True)
+    print("\n📦 === ÉCRITURE GOLD ===")
     
     for nom, df in resultats.items():
-        chemin_parquet = f"{SORTIE_GOLD}/{nom}"
-        chemin_csv = str(csv_output / f"{nom}.csv")
-        
-        nb_lignes = df.count()
-        print(f"✓ Écriture de {nom} ({nb_lignes} lignes)...")
-        
         # Écrire en Parquet
-        df.coalesce(4).write.mode("overwrite").parquet(chemin_parquet)
+        chemin_parquet = f"{SORTIE_GOLD}/{nom}"
+        df.coalesce(1).write.mode("overwrite").parquet(chemin_parquet)
+        print(f"Parquet écrit: {chemin_parquet}")
         
-        # Écrire aussi en CSV (plus lisible)
+        # Écrire en CSV (pour lecture directe)
+        chemin_csv = f"{CSV_OUTPUT_DIR}/{nom}.csv"
         df.coalesce(1).write.mode("overwrite").option("header", "true").csv(chemin_csv)
-        print(f"  ✓ Parquet : {chemin_parquet}")
-        print(f"  ✓ CSV : {chemin_csv}")
+        print(f"CSV écrit: {chemin_csv}")
     
-    print("\n✓ Tous les résultats écrits en Parquet et CSV")
+    temps = time.time() - t0
+    print(f"Temps écriture gold: {temps:.2f}s")
 
 
 def main():
-    temps_debut = time.time()
-    
-    spark = get_spark("Projet Jour 4 - Pipeline Taxi NYC")
-    print("\n" + "="*70)
-    print("PIPELINE ETL + ANALYSE - TAXI NYC (3 mois)")
-    print("="*70)
-    print(f"\n✓ Spark UI disponible sur http://localhost:4040")
-    print("  (Ouvrez-la pendant un job pour voir le DAG et les stages)\n")
+    spark = None
+    t_start = time.time()
 
-    # Étape 1 : ingestion et nettoyage (bronze -> silver)
-    print("\n🔄 ÉTAPE 1 : INGESTION ET NETTOYAGE")
-    temps_etape1 = time.time()
-    brut, nb_brut = ingestion(spark)
-    propre, nb_propre = nettoyage(brut, nb_brut)
-    ecrire_silver(propre, spark)
-    temps_etape1 = time.time() - temps_etape1
-
-    # Étape 2 : transformation et analyses (silver -> gold)
-    print("\n🔄 ÉTAPE 2 : TRANSFORMATIONS ET ANALYSES")
-    temps_etape2 = time.time()
-    resultats = transformation_et_analyses(spark)
-    temps_etape2 = time.time() - temps_etape2
-
-    # Étape 3 : finalisation
-    print("\n🔄 ÉTAPE 3 : FINALISATION")
-    temps_etape3 = time.time()
-    ecrire_gold(resultats)
-    temps_etape3 = time.time() - temps_etape3
-
-    temps_total = time.time() - temps_debut
-    
-    # Résumé final
-    print("\n" + "="*70)
-    print("✓ PIPELINE TERMINÉ AVEC SUCCÈS !")
-    print("="*70)
-    print(f"\n📈 Résumé d'exécution :")
-    print(f"  Étape 1 (Ingestion + Nettoyage) : {temps_etape1:.2f}s")
-    print(f"  Étape 2 (Analyses) : {temps_etape2:.2f}s")
-    print(f"  Étape 3 (Export) : {temps_etape3:.2f}s")
-    print(f"  ────────────────────────────────")
-    print(f"  Total : {temps_total:.2f}s ({temps_total/60:.2f}m)")
-    print(f"\n  Données traitées : {nb_brut:,} lignes brutes → {nb_propre:,} lignes propres")
-    print(f"  Compression : {100 - (nb_propre/nb_brut)*100:.1f}% de doublons/anomalies")
-    
-    # Garder la session vivante pour explorer la Spark UI.
-    input("\n📊 Spark UI sur http://localhost:4040 - Appuyez sur Entrée pour quitter...")
-
-    spark.stop()
-
-
-if __name__ == "__main__":
     try:
-        main()
+        spark = get_spark("Projet Jour 4 - Pipeline MovieLens")
+        print("=" * 70)
+        print("🚀 PIPELINE MOVIELENS - JOUR 4")
+        print("=" * 70)
+        print("Spark UI disponible sur http://localhost:4040")
+
+        # Étape 1 : ingestion et nettoyage (bronze -> silver)
+        ratings_brut, movies_brut = ingestion(spark)
+        nb_ratings_brut = ratings_brut.count()
+
+        ratings_clean, movies_clean = nettoyage(ratings_brut, movies_brut, nb_ratings_brut)
+        ecrire_silver(ratings_clean, movies_clean)
+
+        # Étape 2 : transformation et analyses (silver -> gold)
+        resultats = transformation_et_analyses(spark)
+
+        # Étape 3 : finalisation
+        ecrire_gold(resultats)
+
+        # Résumé final
+        t_total = time.time() - t_start
+        print("\n" + "=" * 70)
+        print("📋 RÉSUMÉ DU PIPELINE")
+        print("=" * 70)
+        print(f"Temps total d'exécution: {t_total:.2f}s")
+        print(f"Ratings traités: {nb_ratings_brut}")
+        print(f"Ratings nettoyés: {ratings_clean.count()}")
+        print(f"Films: {movies_clean.count()}")
+        print("=" * 70)
+
+        # Garder la session vivante pour explorer la Spark UI
+        try:
+            input("\n📊Spark UI sur http://localhost:4040 - Appuyez sur Entrée pour quitter...")
+        except EOFError:
+            pass
+
+        return 0
+
+    except FileNotFoundError as e:
+        print()
+        print("Fichier introuvable pendant l'exécution du pipeline :", e)
+        return 1
     except Exception as e:
         print(f"\n❌ Erreur : {e}")
         import traceback
         traceback.print_exc()
-        sys.exit(1)
+        return 1
+    finally:
+        if spark is not None:
+            spark.stop()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nPipeline interrompu par l'utilisateur.")
+        sys.exit(130)
