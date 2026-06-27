@@ -5,6 +5,8 @@
 - **Date** : 27 juin 2026
 
 - **Archive de livrables** : https://drive.google.com/file/d/1v2qTtXifJHLQG7rMzsvrfH1yU-U6CDz6/view
+- **Livrables** : data/output/
+- **Capture Spark UI** : Projet Jour 4 - Pipeline MovieLens - Spark Jobs.html
 
 ---
 
