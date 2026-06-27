@@ -125,8 +125,8 @@ speedup : 5.12x
 
 - Job observé : exécution complète du pipeline, puis les jobs d’agrégation et de window ranking.
 - Où se produit le shuffle : dans les stages de `groupBy` et de `window` ; c’est visible dans le DAG et les stages de la Spark UI sur `http://localhost:4040`.
-- Nombre de stages et de tasks : la UI montre plusieurs stages pour le pipeline complet, notamment autour des agrégations et du classement par genre ; les détails sont visibles directement dans la page Jobs du run.
-- Capture(s) : à insérer depuis la Spark UI après lancement du pipeline sur `http://localhost:4040`.
+- Nombre de stages et de tasks : la page exportée de la Spark UI permet d’observer les jobs exécutés et leur succession dans le temps ; l’export sauvegardé montre notamment une exécution de l’application avec 87 jobs terminés.
+- Capture(s) : voir le fichier Projet Jour 4 - Pipeline MovieLens - Spark Jobs.html pour consulter la Spark UI exportée.
 - Commentaire : le pipeline est simple et lisible, mais il reste sensible au shuffle sur les agrégations, ce qui justifie l’optimisation par broadcast.
 
 ---
