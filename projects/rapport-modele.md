@@ -4,6 +4,8 @@
 - **Jeu de données** : MovieLens small
 - **Date** : 27 juin 2026
 
+- **Archive de livrables** : https://drive.google.com/file/d/1v2qTtXifJHLQG7rMzsvrfH1yU-U6CDz6/view
+
 ---
 
 ## 1. Jeu de données et schéma cible
